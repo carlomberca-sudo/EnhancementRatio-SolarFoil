@@ -1,555 +1,591 @@
+import re
+from io import StringIO
+from pathlib import Path
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
-from pathlib import Path
-from collections import defaultdict
 
-st.set_page_config(page_title="PLQY Batch Analyzer", layout="wide")
+st.set_page_config(page_title="Enhancement Ratio Analyzer", layout="wide")
 
-APP_DIR = Path(__file__).parent
-DEFAULT_CC_DIR = APP_DIR / "correction_curves"
-
-if "batch_results_ready" not in st.session_state:
-    st.session_state.batch_results_ready = False
-
-if "batch_results_df" not in st.session_state:
-    st.session_state.batch_results_df = pd.DataFrame()
-
-if "batch_wide_summary_df" not in st.session_state:
-    st.session_state.batch_wide_summary_df = pd.DataFrame()
-
-if "batch_warnings_df" not in st.session_state:
-    st.session_state.batch_warnings_df = pd.DataFrame()
-
-if "batch_parsed_df" not in st.session_state:
-    st.session_state.batch_parsed_df = pd.DataFrame()
-
-if "batch_details" not in st.session_state:
-    st.session_state.batch_details = {}
+# -------------------------------------------------
+# Session state
+# -------------------------------------------------
+if "er_results_ready" not in st.session_state:
+    st.session_state.er_results_ready = False
+if "er_summary_df" not in st.session_state:
+    st.session_state.er_summary_df = pd.DataFrame()
+if "er_review_df" not in st.session_state:
+    st.session_state.er_review_df = pd.DataFrame()
+if "er_warnings_df" not in st.session_state:
+    st.session_state.er_warnings_df = pd.DataFrame()
+if "er_details" not in st.session_state:
+    st.session_state.er_details = {}
+if "er_thickness_editor_df" not in st.session_state:
+    st.session_state.er_thickness_editor_df = pd.DataFrame()
 
 
-# -----------------------------
+# -------------------------------------------------
 # Helpers
-# -----------------------------
+# -------------------------------------------------
+def load_spectrum(uploaded_file, skiprows=1, max_rows=1024):
+    data = np.loadtxt(uploaded_file, skiprows=skiprows, max_rows=max_rows)
+    if data.ndim != 2 or data.shape[1] < 3:
+        raise ValueError("Spectrum file must contain at least 3 columns.")
+    channels = data[:, 0]
+    intensity = data[:, 2]
+    return channels, intensity
 
-def extract_excitation(filename: str):
-    for part in filename.split("_"):
-        if part.lower().startswith("exc"):
-            digits = "".join(filter(str.isdigit, part))
-            if digits:
-                return int(digits)
+
+def calculate_wavelengths(channels, center_wavelength=550, grating_number=1):
+    g = 0.4196 if grating_number == 1 else 0.4192
+    return np.array([center_wavelength - ((i - 513) * g) for i in channels], dtype=float)
+
+
+def normalize_name(name: str) -> str:
+    stem = Path(name).stem.upper().strip()
+    stem = re.sub(r"\s+", " ", stem)
+    return stem
+
+
+def detect_is_reference(name: str) -> bool:
+    n = normalize_name(name)
+    return "REF" in n
+
+
+def detect_material_family(name: str):
+    n = normalize_name(name)
+    ordered = ["PMMA", "EMA", "PET", "PE", "LAM"]
+    for fam in ordered:
+        if fam in n:
+            return fam
     return None
 
 
 def extract_sample_name(filename: str):
-    if "_Exc" in filename:
-        return filename.split("_Exc")[0]
-    if "_exc" in filename:
-        return filename.split("_exc")[0]
-    return Path(filename).stem
+    stem = Path(filename).stem
+    stem = stem.replace("_Excplasma_Cen550_NewM266Gr1_Slit100_Filter4_t500ms", "")
+    stem = re.sub(r"_Exc.*$", "", stem, flags=re.IGNORECASE)
+    return normalize_name(stem)
 
 
-def load_spectrum(uploaded_file):
-    data = np.loadtxt(uploaded_file, skiprows=1, max_rows=1024)
-    if data.ndim != 2 or data.shape[1] < 3:
-        raise ValueError("Spectrum file must contain at least 3 columns.")
-    channel = data[:, 1]
-    intensity = data[:, 2]
-    return data, channel, intensity
+def extract_thickness_from_name(sample_name: str):
+    # Supports names like SAMPLE 1-50-A, SAMPLE 2-100-B, etc.
+    wet_to_dry = {50: 11.0, 100: 12.0, 150: 18.0, 200: 38.0, 400: 60.0}
+    parts = re.split(r"[-_ ]+", normalize_name(sample_name))
+    for part in parts:
+        if part.isdigit():
+            val = int(part)
+            if val in wet_to_dry:
+                return wet_to_dry[val], f"inferred_from_name({val})"
+    return None, "missing"
 
 
-def load_single_correction_curve(file_obj, wl_axis):
-    cc_raw = np.genfromtxt(
-        file_obj,
-        delimiter=",",
-        usecols=(0, 1),
-        dtype=float,
-        invalid_raise=False,
-    )
+def match_reference(sample_name: str, available_references: list[str]):
+    sample_norm = normalize_name(sample_name)
+    family = detect_material_family(sample_norm)
 
-    cc_raw = np.atleast_2d(cc_raw)
-    cc_x = cc_raw[:, 0]
-    cc_y = cc_raw[:, 1]
+    if not available_references:
+        return None, "no_references_uploaded"
 
-    mask = (~np.isnan(cc_x)) & (~np.isnan(cc_y))
-    cc_x = cc_x[mask]
-    cc_y = cc_y[mask] * 0.01
+    # 1. same family + REF
+    if family is not None:
+        family_matches = [r for r in available_references if family in normalize_name(r)]
+        if len(family_matches) == 1:
+            return family_matches[0], f"matched_family:{family}"
+        if len(family_matches) > 1:
+            # prefer A if present
+            a_matches = [r for r in family_matches if normalize_name(r).endswith(" A")]
+            if len(a_matches) == 1:
+                return a_matches[0], f"matched_family_prefer_A:{family}"
+            return family_matches[0], f"multiple_family_matches:{family}"
 
-    if cc_y.size < 2:
-        raise ValueError("Correction curve file did not yield usable numeric data.")
+    # 2. fallback generic LAM / PET style refs
+    generic_priority = ["LAM", "PET", "EMA", "PMMA", "PE"]
+    for fam in generic_priority:
+        fam_matches = [r for r in available_references if fam in normalize_name(r)]
+        if len(fam_matches) == 1:
+            return fam_matches[0], f"fallback_family:{fam}"
+        if len(fam_matches) > 1:
+            return fam_matches[0], f"fallback_multiple_family:{fam}"
 
-    looks_like_wavelength = (
-        (cc_x.min() > 100)
-        and (cc_x.max() < 2000)
-        and np.all(np.diff(cc_x) > 0)
-    )
-
-    if looks_like_wavelength:
-        cc_interp = np.interp(wl_axis, cc_x, cc_y, left=cc_y[0], right=cc_y[-1])
-    else:
-        x_old = np.arange(cc_y.size)
-        x_new = np.linspace(0, cc_y.size - 1, wl_axis.size)
-        cc_interp = np.interp(x_new, x_old, cc_y)
-
-    return cc_interp
+    # 3. final fallback first ref
+    return available_references[0], "fallback_first_reference"
 
 
-def build_wavelength_axis(channel, center_wavelength, grating_number):
-    g = 0.4196 if grating_number == 1 else 0.4192
-    return np.array([center_wavelength - ((i - 513) * g) for i in channel], dtype=float)
+def build_review_table(measurement_files, manual_thickness_map=None):
+    manual_thickness_map = manual_thickness_map or {}
+    rows = []
+
+    uploaded_names = [extract_sample_name(f.name) for f in measurement_files]
+    ref_names = [n for n in uploaded_names if detect_is_reference(n)]
+
+    for f in measurement_files:
+        parsed_name = extract_sample_name(f.name)
+        is_ref = detect_is_reference(parsed_name)
+        family = detect_material_family(parsed_name)
+        matched_ref, match_reason = (parsed_name, "self_reference") if is_ref else match_reference(parsed_name, ref_names)
+
+        if parsed_name in manual_thickness_map and manual_thickness_map[parsed_name] not in [None, "", np.nan]:
+            thickness = float(manual_thickness_map[parsed_name])
+            thickness_source = "manual_upload"
+        else:
+            thickness, thickness_source = extract_thickness_from_name(parsed_name)
+
+        rows.append({
+            "File": f.name,
+            "Parsed name": parsed_name,
+            "Type": "Reference" if is_ref else "Sample",
+            "Family": family,
+            "Matched reference": matched_ref,
+            "Reference match reason": match_reason,
+            "Thickness (µm)": thickness,
+            "Thickness source": thickness_source,
+        })
+
+    return pd.DataFrame(rows)
 
 
-def correction_file_matches(name, grating_number, center_wavelength, filter_number):
-    name_lower = name.lower()
-    return (
-        f"g{grating_number}".lower() in name_lower
-        and f"cen{center_wavelength}".lower() in name_lower
-        and f"f{filter_number}".lower() in name_lower
-    )
+def build_thickness_map_from_editor(df_editor: pd.DataFrame):
+    out = {}
+    if df_editor is None or df_editor.empty:
+        return out
+    for _, row in df_editor.iterrows():
+        name = row.get("Parsed name")
+        thickness = row.get("Thickness (µm)")
+        if pd.notna(name) and pd.notna(thickness):
+            out[str(name)] = float(thickness)
+    return out
 
 
-def list_default_correction_files():
-    if not DEFAULT_CC_DIR.exists():
-        return []
-    return sorted([p for p in DEFAULT_CC_DIR.iterdir() if p.suffix.lower() in {".csv", ".txt"}])
+def select_measurement_files(review_df: pd.DataFrame):
+    if review_df.empty:
+        return [], []
+    refs = review_df[review_df["Type"] == "Reference"]["Parsed name"].tolist()
+    samples = review_df[review_df["Type"] == "Sample"]["Parsed name"].tolist()
+    return refs, samples
 
 
-def select_uploaded_correction_file(uploaded_files, grating_number, center_wavelength, filter_number):
-    matches = []
-    for f in uploaded_files:
-        fname = getattr(f, "name", "")
-        if correction_file_matches(fname, grating_number, center_wavelength, filter_number):
-            matches.append(f)
-
-    if len(matches) == 0:
-        raise FileNotFoundError(
-            f"No uploaded correction curve matched G{grating_number}, Cen{center_wavelength}, f{filter_number}."
-        )
-    if len(matches) > 1:
-        raise ValueError(
-            f"Multiple uploaded correction curves matched G{grating_number}, Cen{center_wavelength}, f{filter_number}: "
-            + ", ".join([m.name for m in matches])
-        )
-
-    return matches[0], matches[0].name
+def plot_enhancement_ratio(ax, wl, ratio, sample_name, thickness=None):
+    label = f"{sample_name} / {thickness:.1f} µm" if thickness is not None and pd.notna(thickness) else sample_name
+    ax.plot(wl, ratio, label=label, lw=2)
+    ax.hlines(y=1, xmin=350, xmax=950, colors="black", linestyles="-", lw=1.5)
+    ax.set_xlim(360, 770)
+    ax.set_xlabel("Wavelength (nm)")
+    ax.set_ylabel("Transmission normalized")
+    ax.grid(True, alpha=0.2)
 
 
-def select_default_correction_file(grating_number, center_wavelength, filter_number):
-    files = list_default_correction_files()
-    matches = []
-
-    for path in files:
-        if correction_file_matches(path.name, grating_number, center_wavelength, filter_number):
-            matches.append(path)
-
-    if len(matches) == 0:
-        raise FileNotFoundError(
-            f"No default correction curve matched G{grating_number}, Cen{center_wavelength}, f{filter_number}."
-        )
-    if len(matches) > 1:
-        raise ValueError(
-            f"Multiple default correction curves matched G{grating_number}, Cen{center_wavelength}, f{filter_number}: "
-            + ", ".join([m.name for m in matches])
-        )
-
-    return matches[0], matches[0].name
+def plot_raw_data(ax, wl, sample_i, ref_i, ref_name, sample_name):
+    ax.plot(wl, sample_i, label=sample_name, lw=1)
+    ax.plot(wl, ref_i, label=ref_name, lw=1)
+    ax.set_xlim(360, 770)
+    ax.set_xlabel("Wavelength (nm)")
+    ax.set_ylabel("Intensity")
+    ax.grid(True, alpha=0.2)
 
 
-def compute_plqy(sample_i, ref_i, cc, wl, integration_boundary):
-    dif = sample_i - ref_i
-    dif_correct = dif * cc * wl
+def make_downloadable_summary(results_long: pd.DataFrame):
+    if results_long.empty:
+        return pd.DataFrame()
+    summary = results_long[[
+        "Sample",
+        "Reference",
+        "Family",
+        "Thickness (µm)",
+        "Thickness source",
+        "Mean ratio 400-700",
+        "Min ratio 400-700",
+        "Max ratio 400-700",
+    ]].copy()
+    return summary.sort_values(by=["Sample"]).reset_index(drop=True)
 
-    idx = int(np.argmin(np.abs(wl - integration_boundary)))
 
-    area_em = np.trapezoid(dif_correct[:idx], wl[:idx])
-    area_abs = np.trapezoid(dif_correct[idx:], wl[idx:])
+def band_stats(wl, ratio, lo=400, hi=700):
+    mask = (wl >= lo) & (wl <= hi)
+    if not np.any(mask):
+        return np.nan, np.nan, np.nan
+    vals = ratio[mask]
+    return float(np.mean(vals)), float(np.min(vals)), float(np.max(vals))
 
-    if area_abs == 0:
-        raise ZeroDivisionError("Absorption area is zero, cannot compute PLQY.")
 
-    plqy = (-area_em / area_abs) * 100
-
+def parse_thickness_csv(uploaded_file):
+    if uploaded_file is None:
+        return {}
+    df = pd.read_csv(uploaded_file)
+    required = {"Parsed name", "Thickness (µm)"}
+    if not required.issubset(df.columns):
+        raise ValueError("Thickness CSV must contain columns: 'Parsed name' and 'Thickness (µm)'.")
     return {
-        "dif": dif,
-        "dif_correct": dif_correct,
-        "integration_boundary": integration_boundary,
-        "integration_index": idx,
-        "area_em": area_em,
-        "area_abs": area_abs,
-        "plqy": plqy,
+        normalize_name(str(row["Parsed name"])): float(row["Thickness (µm)"])
+        for _, row in df.iterrows()
+        if pd.notna(row["Parsed name"]) and pd.notna(row["Thickness (µm)"])
     }
 
 
-def build_wide_summary(results_df: pd.DataFrame):
-    if results_df.empty:
-        return pd.DataFrame()
-
-    tmp = results_df.copy()
-    tmp["Exc Label"] = tmp["Excitation (nm)"].apply(lambda x: f"EXC {int(x)}")
-    wide = tmp.pivot_table(index="Sample", columns="Exc Label", values="PLQY (%)", aggfunc="first")
-    wide = wide.reset_index()
-    exc_cols = sorted([c for c in wide.columns if c != "Sample"], key=lambda x: int(x.split()[-1]))
-    return wide[["Sample"] + exc_cols]
-
-
-# -----------------------------
+# -------------------------------------------------
 # UI
-# -----------------------------
-
-st.title("PLQY Batch Analyzer")
+# -------------------------------------------------
+st.title("Enhancement Ratio Analyzer")
 st.caption(
-    "Upload many measurement files, define how references are recognized, and compute PLQY for the whole batch."
+    "Upload all measurement files. The app will detect references, match samples to references, suggest thickness values, and run enhancement-ratio analysis."
 )
 
-left, right = st.columns([1, 1.6], gap="large")
+left, right = st.columns([1, 1.7], gap="large")
 
 with left:
     st.subheader("Inputs")
 
     measurement_files = st.file_uploader(
-        "1. Drop all measurement .txt files",
+        "1. Drop all measurement files",
         type=["txt", "dat", "csv"],
         accept_multiple_files=True,
-        key="measurement_files",
+        key="er_measurement_files",
     )
 
-    reference_keyword = st.text_input(
-        "2. Reference keyword",
-        value="REF",
-        help="Files whose sample name contains this keyword will be treated as references.",
+    center_wavelength = st.number_input(
+        "2. Center wavelength (nm)", min_value=200, max_value=1200, value=550, step=1
     )
+    grating_number = st.selectbox("3. Grating", options=[1, 2], index=1)
 
-    cc_source = st.radio(
-        "3. Correction curves source",
-        options=["Upload correction files now", "Use default files stored in app"],
-    )
+    st.subheader("Optional switches")
+    plot_raw = st.toggle("Show raw spectra", value=False)
+    solve_thickness = st.toggle("Run thickness normalization", value=False)
+    run_simulation = st.toggle("Run simulation", value=False)
 
-    cc_files = []
-    if cc_source == "Upload correction files now":
-        cc_files = st.file_uploader(
-            "Drop correction curve files",
-            type=["csv", "txt"],
-            accept_multiple_files=True,
-            key="cc_multi_batch",
+    simulated_thickness = None
+    if run_simulation:
+        simulated_thickness = st.number_input(
+            "Simulated thickness (µm)", min_value=1.0, max_value=5000.0, value=146.0, step=1.0
         )
-        if cc_files:
-            st.caption(f"Loaded {len(cc_files)} correction files")
-            st.write([f.name for f in cc_files])
-    else:
-        default_cc_files = list_default_correction_files()
-        st.caption(f"Default correction files found in app: {len(default_cc_files)}")
-        if default_cc_files:
-            st.write([p.name for p in default_cc_files])
 
-    grating_number = st.selectbox("4. Grating", options=[1, 2], index=0)
-    filter_number = st.selectbox("5. Filter", options=[1, 2, 3, 4], index=3)
-    default_boundary_offset = st.number_input(
-        "6. Integration boundary offset from excitation (nm)",
-        min_value=-200,
-        max_value=300,
-        value=50,
-        step=1,
+    thickness_csv = st.file_uploader(
+        "Optional thickness CSV",
+        type=["csv"],
+        help="Optional CSV with columns: Parsed name, Thickness (µm)",
+        key="er_thickness_csv",
     )
 
-    run = st.button("Run batch analysis", type="primary", width="stretch")
+    preview = st.button("Preview parsing", type="secondary", width="stretch")
+    run_analysis = st.button("Run enhancement analysis", type="primary", width="stretch")
 
 with right:
-    st.subheader("Results")
+    st.subheader("Review and results")
 
-    if run:
+    manual_thickness_map = {}
+    if thickness_csv is not None:
+        try:
+            manual_thickness_map = parse_thickness_csv(thickness_csv)
+        except Exception as e:
+            st.error(f"Thickness CSV error: {e}")
+
+    if preview or (measurement_files and st.session_state.er_thickness_editor_df.empty):
+        if not measurement_files:
+            st.warning("Upload the measurement files first.")
+        else:
+            review_df = build_review_table(measurement_files, manual_thickness_map=manual_thickness_map)
+            st.session_state.er_review_df = review_df
+            thickness_editor_df = review_df[[
+                "Parsed name", "Type", "Family", "Matched reference", "Thickness (µm)", "Thickness source"
+            ]].copy()
+            st.session_state.er_thickness_editor_df = thickness_editor_df
+
+    if not st.session_state.er_thickness_editor_df.empty:
+        st.subheader("Editable thickness / reference review")
+        edited_df = st.data_editor(
+            st.session_state.er_thickness_editor_df,
+            width="stretch",
+            num_rows="fixed",
+            key="er_data_editor",
+            disabled=["Parsed name", "Type", "Family", "Thickness source"],
+        )
+        st.session_state.er_thickness_editor_df = edited_df.copy()
+
+        review_csv = edited_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            "Download thickness review CSV",
+            data=review_csv,
+            file_name="enhancement_ratio_thickness_review.csv",
+            mime="text/csv",
+            width="stretch",
+        )
+
+    if run_analysis:
         try:
             if not measurement_files:
                 st.error("Please upload the measurement files.")
                 st.stop()
 
-            samples = defaultdict(dict)
-            refs = defaultdict(list)
-            parsed_files = []
+            editor_df = st.session_state.er_thickness_editor_df.copy()
+            if editor_df.empty:
+                editor_df = build_review_table(measurement_files, manual_thickness_map=manual_thickness_map)
+
+            manual_map = build_thickness_map_from_editor(editor_df)
+            review_df = build_review_table(measurement_files, manual_thickness_map=manual_map)
+
+            file_lookup = {extract_sample_name(f.name): f for f in measurement_files}
             warnings = []
-            results = []
             details = {}
+            results_long = []
+            mu_list = []
+            sim_wl = None
+            d_ref = None
 
-            # Parse filenames and group files
-            for uploaded in measurement_files:
-                filename = uploaded.name
-                exc = extract_excitation(filename)
-                sample_name = extract_sample_name(filename)
+            # determine reference thickness target from largest available thickness among samples
+            if solve_thickness:
+                for _, row in review_df.iterrows():
+                    if row["Type"] == "Sample" and pd.notna(row["Thickness (µm)"]):
+                        t = float(row["Thickness (µm)"])
+                        if d_ref is None or t > d_ref:
+                            d_ref = t
 
-                if exc is None:
+            for _, row in review_df.iterrows():
+                if row["Type"] != "Sample":
+                    continue
+
+                sample_name = row["Parsed name"]
+                ref_name = row["Matched reference"]
+                family = row["Family"]
+                thickness = row["Thickness (µm)"]
+                thickness_source = row["Thickness source"]
+
+                if ref_name not in file_lookup:
                     warnings.append({
-                        "Type": "Filename parsing",
-                        "File": filename,
-                        "Message": "Could not extract excitation wavelength from filename.",
+                        "Type": "Missing reference file",
+                        "Sample": sample_name,
+                        "Message": f"Matched reference '{ref_name}' was not found among uploaded files.",
                     })
                     continue
 
-                parsed_files.append({
-                    "File": filename,
-                    "Sample": sample_name,
-                    "Excitation (nm)": exc,
-                    "Reference?": reference_keyword.lower() in sample_name.lower(),
-                })
+                sample_file = file_lookup[sample_name]
+                ref_file = file_lookup[ref_name]
 
                 try:
-                    uploaded.seek(0)
-                except Exception:
-                    pass
-
-                if reference_keyword.lower() in sample_name.lower():
-                    refs[exc].append(uploaded)
-                else:
-                    samples[sample_name][exc] = uploaded
-
-            parsed_df = pd.DataFrame(parsed_files)
-
-            # Main batch computation
-            for sample_name, exc_map in samples.items():
-                for exc, sample_file in sorted(exc_map.items()):
-                    if exc not in refs or not refs[exc]:
-                        warnings.append({
-                            "Type": "Missing reference",
-                            "File": sample_file.name,
-                            "Message": f"No reference found for excitation {exc} nm.",
-                        })
-                        continue
-
-                    if len(refs[exc]) > 1:
-                        warnings.append({
-                            "Type": "Multiple references",
-                            "File": sample_file.name,
-                            "Message": f"Multiple references found for excitation {exc} nm. Using the first one: {refs[exc][0].name}",
-                        })
-
-                    ref_file = refs[exc][0]
-
                     try:
-                        try:
-                            sample_file.seek(0)
-                            ref_file.seek(0)
-                        except Exception:
-                            pass
+                        sample_file.seek(0)
+                        ref_file.seek(0)
+                    except Exception:
+                        pass
 
-                        _, sample_channel, sample_i = load_spectrum(sample_file)
-                        _, ref_channel, ref_i = load_spectrum(ref_file)
+                    channels_s, sample_i = load_spectrum(sample_file)
+                    channels_r, ref_i = load_spectrum(ref_file)
 
-                        if len(sample_channel) != len(ref_channel):
-                            raise ValueError("Sample and reference files do not have the same number of points.")
+                    if len(channels_s) != len(channels_r):
+                        raise ValueError("Sample and reference files do not have the same number of points.")
 
-                        inferred_center = None
-                        for part in sample_file.name.split("_"):
-                            if part.lower().startswith("cen"):
-                                digits = "".join(filter(str.isdigit, part))
-                                if digits:
-                                    inferred_center = int(digits)
-                                    break
+                    wl = calculate_wavelengths(channels_s, center_wavelength=center_wavelength, grating_number=grating_number)
+                    ratio = sample_i / np.clip(ref_i, 1e-12, None)
+                    mean_ratio, min_ratio, max_ratio = band_stats(wl, ratio, 400, 700)
 
-                        if inferred_center is None:
-                            raise ValueError(f"Could not extract center wavelength from filename: {sample_file.name}")
+                    norm_ratio = None
+                    mu_lambda = None
+                    if solve_thickness and pd.notna(thickness) and thickness and d_ref is not None and thickness > 0:
+                        ratio_clipped = np.clip(ratio, 1e-9, None)
+                        norm_ratio = ratio_clipped ** (d_ref / float(thickness))
+                        mu_lambda = (-np.log(ratio_clipped)) / float(thickness)
+                        mu_list.append(mu_lambda)
+                        if sim_wl is None:
+                            sim_wl = wl
 
-                        wl = build_wavelength_axis(sample_channel, inferred_center, grating_number)
+                    results_long.append({
+                        "Sample": sample_name,
+                        "Reference": ref_name,
+                        "Family": family,
+                        "Thickness (µm)": thickness,
+                        "Thickness source": thickness_source,
+                        "Mean ratio 400-700": mean_ratio,
+                        "Min ratio 400-700": min_ratio,
+                        "Max ratio 400-700": max_ratio,
+                    })
 
-                        if cc_source == "Upload correction files now":
-                            if not cc_files:
-                                raise ValueError("No correction curve files were uploaded.")
-                            selected_cc_file, selected_cc_name = select_uploaded_correction_file(
-                                cc_files,
-                                grating_number=grating_number,
-                                center_wavelength=inferred_center,
-                                filter_number=filter_number,
-                            )
-                            try:
-                                selected_cc_file.seek(0)
-                            except Exception:
-                                pass
-                            cc = load_single_correction_curve(selected_cc_file, wl)
-                        else:
-                            selected_cc_path, selected_cc_name = select_default_correction_file(
-                                grating_number=grating_number,
-                                center_wavelength=inferred_center,
-                                filter_number=filter_number,
-                            )
-                            with open(selected_cc_path, "rb") as f:
-                                cc = load_single_correction_curve(f, wl)
+                    details[sample_name] = {
+                        "wl": wl,
+                        "sample_i": sample_i,
+                        "ref_i": ref_i,
+                        "ratio": ratio,
+                        "norm_ratio": norm_ratio,
+                        "mu_lambda": mu_lambda,
+                        "sample_name": sample_name,
+                        "ref_name": ref_name,
+                        "family": family,
+                        "thickness": thickness,
+                    }
 
-                        integration_boundary = exc + default_boundary_offset
+                except Exception as e:
+                    warnings.append({
+                        "Type": "Processing error",
+                        "Sample": sample_name,
+                        "Message": str(e),
+                    })
 
-                        res = compute_plqy(
-                            sample_i=sample_i,
-                            ref_i=ref_i,
-                            cc=cc,
-                            wl=wl,
-                            integration_boundary=integration_boundary,
-                        )
-
-                        results.append({
-                            "Sample": sample_name,
-                            "Excitation (nm)": exc,
-                            "Center (nm)": inferred_center,
-                            "Reference file": ref_file.name,
-                            "Correction file": selected_cc_name,
-                            "PLQY (%)": round(res["plqy"], 2),
-                            "Emission area": res["area_em"],
-                            "Absorption area": res["area_abs"],
-                            "Integration boundary (nm)": integration_boundary,
-                        })
-
-                        details[(sample_name, exc)] = {
-                            "wl": wl,
-                            "sample_i": sample_i,
-                            "ref_i": ref_i,
-                            "dif": res["dif"],
-                            "dif_correct": res["dif_correct"],
-                            "integration_boundary": integration_boundary,
-                            "integration_index": res["integration_index"],
-                            "reference_file": ref_file.name,
-                            "correction_file": selected_cc_name,
-                        }
-
-                    except Exception as e:
-                        warnings.append({
-                            "Type": "Processing error",
-                            "File": sample_file.name,
-                            "Message": str(e),
-                        })
-
-            results_df = pd.DataFrame(results)
-            if not results_df.empty:
-                results_df = results_df.sort_values(by=["Sample", "Excitation (nm)"])
-
+            summary_df = make_downloadable_summary(pd.DataFrame(results_long))
             warnings_df = pd.DataFrame(warnings)
-            wide_summary_df = build_wide_summary(results_df)
 
-            st.session_state.batch_results_df = results_df
-            st.session_state.batch_wide_summary_df = wide_summary_df
-            st.session_state.batch_warnings_df = warnings_df
-            st.session_state.batch_parsed_df = parsed_df
-            st.session_state.batch_details = details
-            st.session_state.batch_results_ready = True
+            simulation = None
+            if run_simulation and mu_list and sim_wl is not None and simulated_thickness is not None:
+                mu_stack = np.vstack(mu_list)
+                mu_mean = np.mean(mu_stack, axis=0)
+                d_sim = float(simulated_thickness)
+                t_sim = np.exp(-mu_mean * d_sim)
+                t_all = np.exp(-mu_stack * d_sim)
+                t_lo = np.min(t_all, axis=0)
+                t_hi = np.max(t_all, axis=0)
+                simulation = {
+                    "wl": sim_wl,
+                    "mean": t_sim,
+                    "lower": t_lo,
+                    "upper": t_hi,
+                    "thickness": d_sim,
+                }
+
+            st.session_state.er_summary_df = summary_df
+            st.session_state.er_review_df = review_df
+            st.session_state.er_warnings_df = warnings_df
+            st.session_state.er_details = {
+                "samples": details,
+                "simulation": simulation,
+                "d_ref": d_ref,
+                "plot_raw": plot_raw,
+                "solve_thickness": solve_thickness,
+                "run_simulation": run_simulation,
+            }
+            st.session_state.er_results_ready = True
 
         except Exception as e:
-            st.error(f"Error while processing files: {e}")
+            st.error(f"Error while running enhancement analysis: {e}")
 
-    if st.session_state.batch_results_ready:
-        results_df = st.session_state.batch_results_df
-        wide_summary_df = st.session_state.batch_wide_summary_df
-        warnings_df = st.session_state.batch_warnings_df
-        parsed_df = st.session_state.batch_parsed_df
-        details = st.session_state.batch_details
+    if st.session_state.er_results_ready:
+        summary_df = st.session_state.er_summary_df
+        review_df = st.session_state.er_review_df
+        warnings_df = st.session_state.er_warnings_df
+        details_state = st.session_state.er_details
+        details = details_state.get("samples", {})
+        simulation = details_state.get("simulation")
+        d_ref = details_state.get("d_ref")
+        plot_raw_state = details_state.get("plot_raw", False)
+        solve_thickness_state = details_state.get("solve_thickness", False)
+        run_simulation_state = details_state.get("run_simulation", False)
 
-        tab1, tab2, tab3, tab4 = st.tabs([
-            "PLQY summary",
-            "Long table",
+        tab1, tab2, tab3, tab4, tab5 = st.tabs([
+            "Summary",
+            "Review table",
             "Graphs",
-            "Warnings / parsed files",
+            "Simulation",
+            "Warnings",
         ])
 
         with tab1:
-            st.subheader("Wide PLQY summary")
-            if wide_summary_df.empty:
-                st.info("No results were generated.")
+            st.subheader("Enhancement ratio summary")
+            if summary_df.empty:
+                st.info("No results generated.")
             else:
-                st.dataframe(wide_summary_df, width="stretch")
-                csv_bytes = wide_summary_df.to_csv(index=False).encode("utf-8")
+                st.dataframe(summary_df, width="stretch")
+                csv_bytes = summary_df.to_csv(index=False).encode("utf-8")
                 st.download_button(
-                    "Download wide summary (CSV)",
+                    "Download summary CSV",
                     data=csv_bytes,
-                    file_name="plqy_batch_summary_wide.csv",
+                    file_name="enhancement_ratio_summary.csv",
                     mime="text/csv",
                     width="stretch",
                 )
 
         with tab2:
-            st.subheader("Detailed results")
-            if results_df.empty:
-                st.info("No detailed results available.")
-            else:
-                st.dataframe(results_df, width="stretch")
-                csv_bytes = results_df.to_csv(index=False).encode("utf-8")
-                st.download_button(
-                    "Download detailed results (CSV)",
-                    data=csv_bytes,
-                    file_name="plqy_batch_results_long.csv",
-                    mime="text/csv",
-                    width="stretch",
-                )
+            st.subheader("Parsed files and matching")
+            st.dataframe(review_df, width="stretch")
 
         with tab3:
             st.subheader("Per-sample graphs")
             if not details:
                 st.info("No graphable results available.")
             else:
-                graph_options = [
-                    f"{sample} | EXC {exc}"
-                    for sample, exc in sorted(details.keys(), key=lambda x: (x[0], x[1]))
-                ]
-                selected_graph = st.selectbox(
-                    "Select result to inspect",
-                    options=graph_options,
-                    key="batch_graph_selector",
+                sample_options = sorted(details.keys())
+                selected_sample = st.selectbox(
+                    "Select sample",
+                    options=sample_options,
+                    key="er_graph_selector",
                 )
-                selected_sample, selected_exc = selected_graph.split(" | EXC ")
-                selected_exc = int(selected_exc)
-                d = details[(selected_sample, selected_exc)]
+                d = details[selected_sample]
 
-                fig1, ax1 = plt.subplots(figsize=(8, 4.5))
-                ax1.plot(d["wl"], d["sample_i"], label="sample")
-                ax1.plot(d["wl"], d["ref_i"], label="reference")
-                ax1.set_title(f"Raw spectra — {selected_sample} — EXC {selected_exc}")
-                ax1.set_xlabel("Wavelength (nm)")
-                ax1.set_ylabel("Intensity")
-                ax1.grid(True)
-                ax1.legend()
+                fig1, ax1 = plt.subplots(figsize=(8, 4.8))
+                plot_enhancement_ratio(ax1, d["wl"], d["ratio"], d["sample_name"], d["thickness"])
+                ax1.legend(loc="best", fontsize=10)
+                ax1.set_title("Enhancement ratio")
                 st.pyplot(fig1)
 
-                fig2, ax2 = plt.subplots(figsize=(8, 4.5))
-                ax2.plot(d["wl"], d["dif"], label="uncorrected")
-                ax2.plot(d["wl"], d["dif_correct"], label="corrected")
-                ax2.axvline(d["integration_boundary"], linestyle="--", label="integration boundary")
-                ax2.set_title(f"Processed spectra — {selected_sample} — EXC {selected_exc}")
-                ax2.set_xlabel("Wavelength (nm)")
-                ax2.set_ylabel("Signal")
-                ax2.grid(True)
-                ax2.legend()
-                st.pyplot(fig2)
+                if plot_raw_state:
+                    fig2, ax2 = plt.subplots(figsize=(8, 4.8))
+                    plot_raw_data(ax2, d["wl"], d["sample_i"], d["ref_i"], d["ref_name"], d["sample_name"])
+                    ax2.legend(loc="best", fontsize=10)
+                    ax2.set_title("Raw spectra")
+                    st.pyplot(fig2)
 
-                fig3, ax3 = plt.subplots(figsize=(8, 5))
-                ax3.plot(d["wl"], d["dif_correct"], label="corrected")
-                ax3.axvline(d["integration_boundary"], linestyle="--", label="boundary")
-                ax3.fill_between(
-                    d["wl"][: d["integration_index"]],
-                    d["dif_correct"][: d["integration_index"]],
-                    alpha=0.3,
-                    label="emission area",
-                )
-                ax3.fill_between(
-                    d["wl"][d["integration_index"] :],
-                    d["dif_correct"][d["integration_index"] :],
-                    alpha=0.3,
-                    label="absorption area",
-                )
-                ax3.set_title(f"Corrected data with integration split — {selected_sample} — EXC {selected_exc}")
-                ax3.set_xlabel("Wavelength (nm)")
-                ax3.set_ylabel("Corrected signal")
-                ax3.grid(True)
-                ax3.legend()
-                st.pyplot(fig3)
+                if solve_thickness_state and d["norm_ratio"] is not None and d_ref is not None:
+                    fig3, ax3 = plt.subplots(figsize=(8, 4.8))
+                    ax3.plot(d["wl"], d["norm_ratio"], lw=2, label=f"{d['sample_name']} → {d_ref:.1f} µm")
+                    ax3.hlines(y=1, xmin=350, xmax=950, colors="black", linestyles="-", lw=1.5)
+                    ax3.set_xlim(360, 770)
+                    ax3.set_xlabel("Wavelength (nm)")
+                    ax3.set_ylabel(f"Transmission at d = {d_ref:.1f} µm")
+                    ax3.grid(True, alpha=0.2)
+                    ax3.legend(loc="best", fontsize=10)
+                    ax3.set_title("Thickness-normalized transmission")
+                    st.pyplot(fig3)
 
-                st.write("Reference file used:", d["reference_file"])
-                st.write("Correction file used:", d["correction_file"])
+                st.write("Reference used:", d["ref_name"])
+                st.write("Family:", d["family"])
+                st.write("Thickness (µm):", d["thickness"])
 
         with tab4:
+            st.subheader("Simulation")
+            if not run_simulation_state:
+                st.info("Simulation was turned off.")
+            elif simulation is None:
+                st.info("No simulation available. Enable thickness normalization and ensure at least one valid thickness is present.")
+            else:
+                fig_sim, ax_sim = plt.subplots(figsize=(8, 4.8))
+                ax_sim.plot(
+                    simulation["wl"],
+                    simulation["mean"],
+                    lw=2,
+                    label=f"Simulated, d = {simulation['thickness']:.1f} µm (mean μ)",
+                )
+                ax_sim.fill_between(
+                    simulation["wl"],
+                    simulation["lower"],
+                    simulation["upper"],
+                    alpha=0.3,
+                    label="Envelope from all μ(λ) samples",
+                )
+                ax_sim.set_xlim(360, 770)
+                ax_sim.set_xlabel("Wavelength (nm)")
+                ax_sim.set_ylabel(f"Predicted transmission at d = {simulation['thickness']:.1f} µm")
+                ax_sim.grid(True, alpha=0.2)
+                ax_sim.legend(loc="best", fontsize=10)
+                ax_sim.set_title("Predicted transmission by thickness")
+                st.pyplot(fig_sim)
+
+                sim_df = pd.DataFrame({
+                    "Wavelength_nm": simulation["wl"],
+                    "T_sim": simulation["mean"],
+                    "T_sim_lower": simulation["lower"],
+                    "T_sim_upper": simulation["upper"],
+                })
+                st.dataframe(sim_df, width="stretch")
+                st.download_button(
+                    "Download simulation CSV",
+                    data=sim_df.to_csv(index=False).encode("utf-8"),
+                    file_name="enhancement_ratio_simulation.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+        with tab5:
             st.subheader("Warnings")
             if warnings_df.empty:
                 st.success("No warnings.")
             else:
                 st.dataframe(warnings_df, width="stretch")
-
-            st.subheader("Parsed uploaded files")
-            if parsed_df.empty:
-                st.info("No files were parsed.")
-            else:
-                st.dataframe(parsed_df, width="stretch")
-
     else:
-        st.info("Upload the measurement files, define the reference keyword, and click 'Run batch analysis'.")
+        st.info("Upload files, preview parsing, optionally edit thickness, then run the analysis.")
