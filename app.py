@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
 
 st.set_page_config(page_title="Enhancement Ratio Analyzer", layout="wide")
 
@@ -228,6 +229,85 @@ def parse_thickness_csv(uploaded_file):
 # -------------------------------------------------
 # UI
 # -------------------------------------------------
+def make_sample_label(sample_name, thickness=None, ref_name=None):
+    label = sample_name
+    if thickness is not None and pd.notna(thickness):
+        label += f" / {float(thickness):.1f} µm"
+    if ref_name:
+        label += f" | ref: {ref_name}"
+    return label
+
+
+def build_plotly_figure(
+    details_dict,
+    selected_samples,
+    mode="ratio",
+    d_ref=None,
+    x_range=None,
+):
+    fig = go.Figure()
+
+    for sample_name in selected_samples:
+        d = details_dict[sample_name]
+
+        if mode == "ratio":
+            y = d["ratio"]
+            y_label = "Transmission normalized"
+            title = "Enhancement ratio"
+            trace_label = make_sample_label(
+                d["sample_name"], d["thickness"], d["ref_name"]
+            )
+
+        elif mode == "raw_sample":
+            y = d["sample_i"]
+            y_label = "Intensity"
+            title = "Raw sample spectra"
+            trace_label = d["sample_name"]
+
+        elif mode == "raw_reference":
+            y = d["ref_i"]
+            y_label = "Intensity"
+            title = "Raw reference spectra"
+            trace_label = f"{d['sample_name']} | {d['ref_name']}"
+
+        elif mode == "thickness_norm":
+            if d["norm_ratio"] is None:
+                continue
+            y = d["norm_ratio"]
+            y_label = f"Transmission at d = {d_ref:.1f} µm" if d_ref is not None else "Transmission"
+            title = "Thickness-normalized transmission"
+            trace_label = f"{d['sample_name']} → {d_ref:.1f} µm"
+
+        else:
+            continue
+
+        fig.add_trace(
+            go.Scatter(
+                x=d["wl"],
+                y=y,
+                mode="lines",
+                name=trace_label,
+            )
+        )
+
+    if mode in ["ratio", "thickness_norm"]:
+        fig.add_hline(y=1, line_width=1.5, line_color="black")
+
+    fig.update_layout(
+        title=title,
+        xaxis_title="Wavelength (nm)",
+        yaxis_title=y_label,
+        hovermode="x unified",
+        legend_title="Samples",
+    )
+
+    if x_range is not None:
+        fig.update_xaxes(range=x_range)
+    else:
+        fig.update_xaxes(range=[360, 770])
+
+    return fig
+
 st.title("Enhancement Ratio Analyzer")
 st.caption(
     "Upload all measurement files. The app will detect references, match samples to references, suggest thickness values, and run enhancement-ratio analysis."
@@ -494,48 +574,95 @@ with right:
         with tab2:
             st.subheader("Parsed files and matching")
             st.dataframe(review_df, width="stretch")
-
+                                                
         with tab3:
-            st.subheader("Per-sample graphs")
-            if not details:
-                st.info("No graphable results available.")
-            else:
-                sample_options = sorted(details.keys())
-                selected_sample = st.selectbox(
-                    "Select sample",
-                    options=sample_options,
-                    key="er_graph_selector",
+    st.subheader("Interactive graphs")
+
+    if not details:
+        st.info("No graphable results available.")
+    else:
+        sample_options = sorted(details.keys())
+
+        selected_samples = st.multiselect(
+            "Select one or more samples to overlay",
+            options=sample_options,
+            default=sample_options[: min(3, len(sample_options))],
+            key="er_graph_multiselect",
+        )
+
+        if not selected_samples:
+            st.warning("Select at least one sample.")
+        else:
+            graph_mode_options = ["Enhancement ratio"]
+            if plot_raw_state:
+                graph_mode_options.extend(["Raw sample spectra", "Raw reference spectra"])
+            if solve_thickness_state:
+                has_norm = any(details[s]["norm_ratio"] is not None for s in selected_samples)
+                if has_norm:
+                    graph_mode_options.append("Thickness-normalized transmission")
+
+            graph_mode = st.radio(
+                "Graph type",
+                options=graph_mode_options,
+                horizontal=True,
+                key="er_graph_mode",
+            )
+
+            x_min, x_max = st.slider(
+                "Displayed wavelength range (nm)",
+                min_value=300,
+                max_value=900,
+                value=(360, 770),
+                step=1,
+                key="er_graph_range",
+            )
+
+            if graph_mode == "Enhancement ratio":
+                fig = build_plotly_figure(
+                    details_dict=details,
+                    selected_samples=selected_samples,
+                    mode="ratio",
+                    d_ref=d_ref,
+                    x_range=[x_min, x_max],
                 )
-                d = details[selected_sample]
+            elif graph_mode == "Raw sample spectra":
+                fig = build_plotly_figure(
+                    details_dict=details,
+                    selected_samples=selected_samples,
+                    mode="raw_sample",
+                    d_ref=d_ref,
+                    x_range=[x_min, x_max],
+                )
+            elif graph_mode == "Raw reference spectra":
+                fig = build_plotly_figure(
+                    details_dict=details,
+                    selected_samples=selected_samples,
+                    mode="raw_reference",
+                    d_ref=d_ref,
+                    x_range=[x_min, x_max],
+                )
+            else:
+                fig = build_plotly_figure(
+                    details_dict=details,
+                    selected_samples=selected_samples,
+                    mode="thickness_norm",
+                    d_ref=d_ref,
+                    x_range=[x_min, x_max],
+                )
 
-                fig1, ax1 = plt.subplots(figsize=(8, 4.8))
-                plot_enhancement_ratio(ax1, d["wl"], d["ratio"], d["sample_name"], d["thickness"])
-                ax1.legend(loc="best", fontsize=10)
-                ax1.set_title("Enhancement ratio")
-                st.pyplot(fig1)
+            st.plotly_chart(fig, width="stretch")
 
-                if plot_raw_state:
-                    fig2, ax2 = plt.subplots(figsize=(8, 4.8))
-                    plot_raw_data(ax2, d["wl"], d["sample_i"], d["ref_i"], d["ref_name"], d["sample_name"])
-                    ax2.legend(loc="best", fontsize=10)
-                    ax2.set_title("Raw spectra")
-                    st.pyplot(fig2)
-
-                if solve_thickness_state and d["norm_ratio"] is not None and d_ref is not None:
-                    fig3, ax3 = plt.subplots(figsize=(8, 4.8))
-                    ax3.plot(d["wl"], d["norm_ratio"], lw=2, label=f"{d['sample_name']} → {d_ref:.1f} µm")
-                    ax3.hlines(y=1, xmin=350, xmax=950, colors="black", linestyles="-", lw=1.5)
-                    ax3.set_xlim(360, 770)
-                    ax3.set_xlabel("Wavelength (nm)")
-                    ax3.set_ylabel(f"Transmission at d = {d_ref:.1f} µm")
-                    ax3.grid(True, alpha=0.2)
-                    ax3.legend(loc="best", fontsize=10)
-                    ax3.set_title("Thickness-normalized transmission")
-                    st.pyplot(fig3)
-
-                st.write("Reference used:", d["ref_name"])
-                st.write("Family:", d["family"])
-                st.write("Thickness (µm):", d["thickness"])
+            st.subheader("Selected sample details")
+            detail_rows = []
+            for s in selected_samples:
+                d = details[s]
+                detail_rows.append({
+                    "Sample": d["sample_name"],
+                    "Reference": d["ref_name"],
+                    "Family": d["family"],
+                    "Thickness (µm)": d["thickness"],
+                })
+            st.dataframe(pd.DataFrame(detail_rows), width="stretch")
 
         with tab4:
             st.subheader("Simulation")
