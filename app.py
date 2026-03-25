@@ -10,6 +10,24 @@ st.set_page_config(page_title="PLQY Batch Analyzer", layout="wide")
 APP_DIR = Path(__file__).parent
 DEFAULT_CC_DIR = APP_DIR / "correction_curves"
 
+if "batch_results_ready" not in st.session_state:
+    st.session_state.batch_results_ready = False
+
+if "batch_results_df" not in st.session_state:
+    st.session_state.batch_results_df = pd.DataFrame()
+
+if "batch_wide_summary_df" not in st.session_state:
+    st.session_state.batch_wide_summary_df = pd.DataFrame()
+
+if "batch_warnings_df" not in st.session_state:
+    st.session_state.batch_warnings_df = pd.DataFrame()
+
+if "batch_parsed_df" not in st.session_state:
+    st.session_state.batch_parsed_df = pd.DataFrame()
+
+if "batch_details" not in st.session_state:
+    st.session_state.batch_details = {}
+
 
 # -----------------------------
 # Helpers
@@ -234,7 +252,7 @@ with left:
         step=1,
     )
 
-    run = st.button("Run batch analysis", type="primary", use_container_width=True)
+    run = st.button("Run batch analysis", type="primary", width="stretch")
 
 with right:
     st.subheader("Results")
@@ -318,9 +336,7 @@ with right:
                         if len(sample_channel) != len(ref_channel):
                             raise ValueError("Sample and reference files do not have the same number of points.")
 
-                        # Infer center wavelength from filename if present, fallback later
                         inferred_center = None
-                        lower_name = sample_file.name.lower()
                         for part in sample_file.name.split("_"):
                             if part.lower().startswith("cen"):
                                 digits = "".join(filter(str.isdigit, part))
@@ -400,117 +416,140 @@ with right:
             results_df = pd.DataFrame(results)
             if not results_df.empty:
                 results_df = results_df.sort_values(by=["Sample", "Excitation (nm)"])
+
             warnings_df = pd.DataFrame(warnings)
             wide_summary_df = build_wide_summary(results_df)
 
-            tab1, tab2, tab3, tab4 = st.tabs([
-                "PLQY summary",
-                "Long table",
-                "Graphs",
-                "Warnings / parsed files",
-            ])
-
-            with tab1:
-                st.subheader("Wide PLQY summary")
-                if wide_summary_df.empty:
-                    st.info("No results were generated.")
-                else:
-                    st.dataframe(wide_summary_df, use_container_width=True)
-                    csv_bytes = wide_summary_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "Download wide summary (CSV)",
-                        data=csv_bytes,
-                        file_name="plqy_batch_summary_wide.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-
-            with tab2:
-                st.subheader("Detailed results")
-                if results_df.empty:
-                    st.info("No detailed results available.")
-                else:
-                    st.dataframe(results_df, use_container_width=True)
-                    csv_bytes = results_df.to_csv(index=False).encode("utf-8")
-                    st.download_button(
-                        "Download detailed results (CSV)",
-                        data=csv_bytes,
-                        file_name="plqy_batch_results_long.csv",
-                        mime="text/csv",
-                        use_container_width=True,
-                    )
-
-            with tab3:
-                st.subheader("Per-sample graphs")
-                if not details:
-                    st.info("No graphable results available.")
-                else:
-                    graph_options = [f"{sample} | EXC {exc}" for sample, exc in sorted(details.keys(), key=lambda x: (x[0], x[1]))]
-                    selected_graph = st.selectbox("Select result to inspect", options=graph_options)
-                    selected_sample, selected_exc = selected_graph.split(" | EXC ")
-                    selected_exc = int(selected_exc)
-                    d = details[(selected_sample, selected_exc)]
-
-                    fig1, ax1 = plt.subplots(figsize=(8, 4.5))
-                    ax1.plot(d["wl"], d["sample_i"], label="sample")
-                    ax1.plot(d["wl"], d["ref_i"], label="reference")
-                    ax1.set_title(f"Raw spectra — {selected_sample} — EXC {selected_exc}")
-                    ax1.set_xlabel("Wavelength (nm)")
-                    ax1.set_ylabel("Intensity")
-                    ax1.grid(True)
-                    ax1.legend()
-                    st.pyplot(fig1)
-
-                    fig2, ax2 = plt.subplots(figsize=(8, 4.5))
-                    ax2.plot(d["wl"], d["dif"], label="uncorrected")
-                    ax2.plot(d["wl"], d["dif_correct"], label="corrected")
-                    ax2.axvline(d["integration_boundary"], linestyle="--", label="integration boundary")
-                    ax2.set_title(f"Processed spectra — {selected_sample} — EXC {selected_exc}")
-                    ax2.set_xlabel("Wavelength (nm)")
-                    ax2.set_ylabel("Signal")
-                    ax2.grid(True)
-                    ax2.legend()
-                    st.pyplot(fig2)
-
-                    fig3, ax3 = plt.subplots(figsize=(8, 5))
-                    ax3.plot(d["wl"], d["dif_correct"], label="corrected")
-                    ax3.axvline(d["integration_boundary"], linestyle="--", label="boundary")
-                    ax3.fill_between(
-                        d["wl"][: d["integration_index"]],
-                        d["dif_correct"][: d["integration_index"]],
-                        alpha=0.3,
-                        label="emission area",
-                    )
-                    ax3.fill_between(
-                        d["wl"][d["integration_index"] :],
-                        d["dif_correct"][d["integration_index"] :],
-                        alpha=0.3,
-                        label="absorption area",
-                    )
-                    ax3.set_title(f"Corrected data with integration split — {selected_sample} — EXC {selected_exc}")
-                    ax3.set_xlabel("Wavelength (nm)")
-                    ax3.set_ylabel("Corrected signal")
-                    ax3.grid(True)
-                    ax3.legend()
-                    st.pyplot(fig3)
-
-                    st.write("Reference file used:", d["reference_file"])
-                    st.write("Correction file used:", d["correction_file"])
-
-            with tab4:
-                st.subheader("Warnings")
-                if warnings_df.empty:
-                    st.success("No warnings.")
-                else:
-                    st.dataframe(warnings_df, use_container_width=True)
-
-                st.subheader("Parsed uploaded files")
-                if parsed_df.empty:
-                    st.info("No files were parsed.")
-                else:
-                    st.dataframe(parsed_df, use_container_width=True)
+            st.session_state.batch_results_df = results_df
+            st.session_state.batch_wide_summary_df = wide_summary_df
+            st.session_state.batch_warnings_df = warnings_df
+            st.session_state.batch_parsed_df = parsed_df
+            st.session_state.batch_details = details
+            st.session_state.batch_results_ready = True
 
         except Exception as e:
             st.error(f"Error while processing files: {e}")
+
+    if st.session_state.batch_results_ready:
+        results_df = st.session_state.batch_results_df
+        wide_summary_df = st.session_state.batch_wide_summary_df
+        warnings_df = st.session_state.batch_warnings_df
+        parsed_df = st.session_state.batch_parsed_df
+        details = st.session_state.batch_details
+
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "PLQY summary",
+            "Long table",
+            "Graphs",
+            "Warnings / parsed files",
+        ])
+
+        with tab1:
+            st.subheader("Wide PLQY summary")
+            if wide_summary_df.empty:
+                st.info("No results were generated.")
+            else:
+                st.dataframe(wide_summary_df, width="stretch")
+                csv_bytes = wide_summary_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download wide summary (CSV)",
+                    data=csv_bytes,
+                    file_name="plqy_batch_summary_wide.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+        with tab2:
+            st.subheader("Detailed results")
+            if results_df.empty:
+                st.info("No detailed results available.")
+            else:
+                st.dataframe(results_df, width="stretch")
+                csv_bytes = results_df.to_csv(index=False).encode("utf-8")
+                st.download_button(
+                    "Download detailed results (CSV)",
+                    data=csv_bytes,
+                    file_name="plqy_batch_results_long.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+        with tab3:
+            st.subheader("Per-sample graphs")
+            if not details:
+                st.info("No graphable results available.")
+            else:
+                graph_options = [
+                    f"{sample} | EXC {exc}"
+                    for sample, exc in sorted(details.keys(), key=lambda x: (x[0], x[1]))
+                ]
+                selected_graph = st.selectbox(
+                    "Select result to inspect",
+                    options=graph_options,
+                    key="batch_graph_selector",
+                )
+                selected_sample, selected_exc = selected_graph.split(" | EXC ")
+                selected_exc = int(selected_exc)
+                d = details[(selected_sample, selected_exc)]
+
+                fig1, ax1 = plt.subplots(figsize=(8, 4.5))
+                ax1.plot(d["wl"], d["sample_i"], label="sample")
+                ax1.plot(d["wl"], d["ref_i"], label="reference")
+                ax1.set_title(f"Raw spectra — {selected_sample} — EXC {selected_exc}")
+                ax1.set_xlabel("Wavelength (nm)")
+                ax1.set_ylabel("Intensity")
+                ax1.grid(True)
+                ax1.legend()
+                st.pyplot(fig1)
+
+                fig2, ax2 = plt.subplots(figsize=(8, 4.5))
+                ax2.plot(d["wl"], d["dif"], label="uncorrected")
+                ax2.plot(d["wl"], d["dif_correct"], label="corrected")
+                ax2.axvline(d["integration_boundary"], linestyle="--", label="integration boundary")
+                ax2.set_title(f"Processed spectra — {selected_sample} — EXC {selected_exc}")
+                ax2.set_xlabel("Wavelength (nm)")
+                ax2.set_ylabel("Signal")
+                ax2.grid(True)
+                ax2.legend()
+                st.pyplot(fig2)
+
+                fig3, ax3 = plt.subplots(figsize=(8, 5))
+                ax3.plot(d["wl"], d["dif_correct"], label="corrected")
+                ax3.axvline(d["integration_boundary"], linestyle="--", label="boundary")
+                ax3.fill_between(
+                    d["wl"][: d["integration_index"]],
+                    d["dif_correct"][: d["integration_index"]],
+                    alpha=0.3,
+                    label="emission area",
+                )
+                ax3.fill_between(
+                    d["wl"][d["integration_index"] :],
+                    d["dif_correct"][d["integration_index"] :],
+                    alpha=0.3,
+                    label="absorption area",
+                )
+                ax3.set_title(f"Corrected data with integration split — {selected_sample} — EXC {selected_exc}")
+                ax3.set_xlabel("Wavelength (nm)")
+                ax3.set_ylabel("Corrected signal")
+                ax3.grid(True)
+                ax3.legend()
+                st.pyplot(fig3)
+
+                st.write("Reference file used:", d["reference_file"])
+                st.write("Correction file used:", d["correction_file"])
+
+        with tab4:
+            st.subheader("Warnings")
+            if warnings_df.empty:
+                st.success("No warnings.")
+            else:
+                st.dataframe(warnings_df, width="stretch")
+
+            st.subheader("Parsed uploaded files")
+            if parsed_df.empty:
+                st.info("No files were parsed.")
+            else:
+                st.dataframe(parsed_df, width="stretch")
+
     else:
         st.info("Upload the measurement files, define the reference keyword, and click 'Run batch analysis'.")
